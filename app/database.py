@@ -90,6 +90,36 @@ CREATE TABLE IF NOT EXISTS rebuild_runs (
     started_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     finished_at TEXT
 );
+
+-- Shift sampling QC conclusions, kept for later query.
+--   status = 'current' : the conclusion reflects the latest accepted data
+--   status = 'stale'   : revoked the moment a reading/handover of the same
+--                        device was accepted, or superseded by a fresh
+--                        assessment of the same shift window; never revived
+-- shift_energy_kwh is NULL unless current intervals tile the whole shift and
+-- every one of them is determinable — it is never a placeholder zero.
+CREATE TABLE IF NOT EXISTS shift_assessments (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id          TEXT    NOT NULL,
+    shift_start        TEXT    NOT NULL,        -- UTC, ISO-8601
+    shift_end          TEXT    NOT NULL,
+    collect_deadline   TEXT    NOT NULL,
+    assessed_at        TEXT    NOT NULL,
+    analysis_ready     INTEGER NOT NULL CHECK (analysis_ready IN (0,1)),
+    shift_energy_kwh   REAL,                    -- NULL when not exactly determinable
+    expected_samples   INTEGER NOT NULL,
+    on_time_count      INTEGER NOT NULL,
+    overdue_count      INTEGER NOT NULL,
+    missing_count      INTEGER NOT NULL,
+    multi_source_count INTEGER NOT NULL,
+    samples_json       TEXT    NOT NULL,        -- per-moment verdicts with source ids
+    coverage_json      TEXT    NOT NULL,        -- gaps / undeterminable / pending rebuild
+    reasons_json       TEXT    NOT NULL,
+    status             TEXT    NOT NULL CHECK (status IN ('current','stale')),
+    superseded_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_shift_assess_device_status
+    ON shift_assessments(device_id, status);
 """
 
 

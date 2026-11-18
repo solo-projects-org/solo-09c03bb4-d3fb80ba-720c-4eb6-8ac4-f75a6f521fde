@@ -16,3 +16,12 @@ class RebuildFailure(Exception):
         self.device_id = device_id
         self.reason = reason
         super().__init__(f"rebuild failed for device {device_id}: {reason}")
+
+
+class UnprocessableError(Exception):
+    """422: the request is well-formed but a business rule rejects it
+    (e.g. assessing a shift before its collection deadline has passed)."""
+
+    def __init__(self, detail: str):
+        self.detail = detail
+        super().__init__(detail)

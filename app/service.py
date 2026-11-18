@@ -19,9 +19,10 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from datetime import datetime, timedelta
 
-from .errors import ConflictError, RebuildFailure
-from .models import HandoverIn, ReadingIn, to_utc_iso, utc_now_iso
+from .errors import ConflictError, RebuildFailure, UnprocessableError
+from .models import HandoverIn, ReadingIn, ShiftQcIn, to_utc_iso, utc_now_iso
 
 
 def _hash(payload: dict) -> str:
@@ -96,6 +97,24 @@ def _stale_current_intervals(conn: sqlite3.Connection, device_ids: list[str]) ->
     return cur.rowcount
 
 
+def _stale_current_shift_assessments(conn: sqlite3.Connection, device_ids: list[str]) -> int:
+    """Immediately revoke current eligibility of stored shift QC conclusions.
+
+    Runs inside the same transaction that accepts a reading/handover, so the
+    revocation commits even when the subsequent rebuild fails, and nothing on
+    the rebuild/restart path ever flips a stale conclusion back to current.
+    """
+    if not device_ids:
+        return 0
+    placeholders = ",".join("?" for _ in device_ids)
+    cur = conn.execute(
+        f"UPDATE shift_assessments SET status = 'stale', "
+        f"superseded_at = ? WHERE status = 'current' AND device_id IN ({placeholders})",
+        [utc_now_iso(), *device_ids],
+    )
+    return cur.rowcount
+
+
 def submit_reading(conn: sqlite3.Connection, payload: ReadingIn) -> dict:
     ts_iso = to_utc_iso(payload.ts)
     content = {
@@ -132,6 +151,7 @@ def submit_reading(conn: sqlite3.Connection, payload: ReadingIn) -> dict:
                 devices.add(prev["device_id"])
             affected = sorted(devices)
             _stale_current_intervals(conn, affected)
+            _stale_current_shift_assessments(conn, affected)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -183,6 +203,7 @@ def submit_handover(conn: sqlite3.Connection, payload: HandoverIn) -> dict:
                 devices.add(prev["device_id"])
             affected = sorted(devices)
             _stale_current_intervals(conn, affected)
+            _stale_current_shift_assessments(conn, affected)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -472,3 +493,294 @@ def list_intervals(
         f"SELECT * FROM intervals{where} ORDER BY device_id, start_ts, id",
         params,
     ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Shift sampling quality control
+# ---------------------------------------------------------------------------
+
+def _parse_iso(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def assess_shift(conn: sqlite3.Connection, payload: ShiftQcIn) -> dict:
+    """Evaluate one device's shift sampling quality and persist the conclusion.
+
+    Everything — superseding the previous conclusion of the same window,
+    reading the latest revisions / current intervals, and inserting the new
+    conclusion — happens in a single transaction, so the assessment is always
+    computed from one consistent snapshot of current data.
+
+    Punctuality is judged solely by the *acceptance time of each source's
+    current revision*: a late re-submission (higher revision) cannot inherit
+    the on-time qualification of the revision it replaced.
+    """
+    device = payload.device_id
+    start_iso = to_utc_iso(payload.shift_start)
+    end_iso = to_utc_iso(payload.shift_end)
+    deadline_iso = to_utc_iso(payload.collect_deadline)
+    now_iso = utc_now_iso()
+    if _parse_iso(now_iso) < _parse_iso(deadline_iso):
+        raise UnprocessableError(
+            f"collect_deadline {deadline_iso} has not passed yet; "
+            "shift sampling QC only runs after the collection deadline"
+        )
+
+    start_dt = _parse_iso(start_iso)
+    end_dt = _parse_iso(end_iso)
+    step = timedelta(minutes=15)
+    n_steps = int((end_dt - start_dt) // step)
+    sample_ts = [to_utc_iso(start_dt + i * step) for i in range(n_steps + 1)]
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # A fresh assessment of the same shift window supersedes the previous
+        # current one; conclusions of other windows/devices stay untouched.
+        conn.execute(
+            "UPDATE shift_assessments SET status = 'stale', superseded_at = ? "
+            "WHERE status = 'current' AND device_id = ? "
+            "AND shift_start = ? AND shift_end = ?",
+            (now_iso, device, start_iso, end_iso),
+        )
+
+        # --- per-moment sampling verdicts (latest revision per source only) ---
+        readings = _latest_readings(conn, device)
+        by_ts: dict[str, list[sqlite3.Row]] = {}
+        for r in readings:
+            by_ts.setdefault(r["ts"], []).append(r)
+
+        deadline_dt = _parse_iso(deadline_iso)
+        samples: list[dict] = []
+        on_time = overdue = missing = multi = 0
+        for ts in sample_ts:
+            rows = by_ts.get(ts, [])
+            if not rows:
+                samples.append({"ts": ts, "status": "missing", "sources": []})
+                missing += 1
+                continue
+            if len(rows) > 1:
+                sources = [
+                    {
+                        "source_id": r["source_id"],
+                        "revision": r["revision"],
+                        "accepted_at": r["created_at"],
+                    }
+                    for r in sorted(rows, key=lambda x: x["source_id"])
+                ]
+                samples.append({"ts": ts, "status": "multi_source", "sources": sources})
+                multi += 1
+                continue
+            r = rows[0]
+            status = "on_time" if _parse_iso(r["created_at"]) <= deadline_dt else "overdue"
+            if status == "on_time":
+                on_time += 1
+            else:
+                overdue += 1
+            samples.append({
+                "ts": ts,
+                "status": status,
+                "sources": [{
+                    "source_id": r["source_id"],
+                    "revision": r["revision"],
+                    "accepted_at": r["created_at"],
+                }],
+            })
+
+        # --- coverage of the shift by current (determinable) intervals ---
+        intervals = conn.execute(
+            "SELECT * FROM intervals WHERE device_id = ? AND status = 'current' "
+            "ORDER BY start_ts, id",
+            (device,),
+        ).fetchall()
+        relevant = [
+            iv for iv in intervals
+            if iv["start_ts"] < end_iso and iv["end_ts"] > start_iso
+        ]
+
+        gaps: list[dict] = []
+        cursor = start_iso
+        for iv in sorted(relevant, key=lambda x: (x["start_ts"], x["end_ts"])):
+            s = max(iv["start_ts"], start_iso)
+            e = min(iv["end_ts"], end_iso)
+            if e <= s:
+                continue
+            if s > cursor:
+                gaps.append({"start_ts": cursor, "end_ts": s})
+            if e > cursor:
+                cursor = e
+        if cursor < end_iso:
+            gaps.append({"start_ts": cursor, "end_ts": end_iso})
+
+        undeterminable = [
+            {"start_ts": iv["start_ts"], "end_ts": iv["end_ts"], "reason": iv["reason"]}
+            for iv in relevant
+            if iv["energy_kwh"] is None
+        ]
+        boundary_crossing = [
+            {"start_ts": iv["start_ts"], "end_ts": iv["end_ts"]}
+            for iv in relevant
+            if iv["start_ts"] < start_iso or iv["end_ts"] > end_iso
+        ]
+        full_coverage = not gaps
+        all_determinable = not undeterminable
+        exact_tiling = full_coverage and not boundary_crossing
+
+        stale_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM intervals "
+            "WHERE device_id = ? AND status = 'stale'",
+            (device,),
+        ).fetchone()["n"]
+        pending_rebuild = False
+        if gaps:
+            if stale_count > 0:
+                pending_rebuild = True
+            elif readings:
+                r_min = min(r["ts"] for r in readings)
+                r_max = max(r["ts"] for r in readings)
+                pending_rebuild = any(
+                    g["start_ts"] >= r_min and g["end_ts"] <= r_max for g in gaps
+                )
+
+        reasons: list[str] = []
+        if missing:
+            reasons.append(
+                "missing_samples: no current reading at "
+                + ", ".join(s["ts"] for s in samples if s["status"] == "missing")
+            )
+        if overdue:
+            reasons.append(
+                "overdue_samples: current revision accepted after collect_deadline at "
+                + ", ".join(
+                    f"{s['ts']}({s['sources'][0]['source_id']} "
+                    f"rev{s['sources'][0]['revision']})"
+                    for s in samples if s["status"] == "overdue"
+                )
+            )
+        if multi:
+            reasons.append(
+                "multi_source_samples: more than one current source at "
+                + ", ".join(
+                    f"{s['ts']}({'+'.join(x['source_id'] for x in s['sources'])})"
+                    for s in samples if s["status"] == "multi_source"
+                )
+            )
+        if pending_rebuild:
+            reasons.append(
+                "intervals_pending_rebuild: current intervals do not fully cover "
+                "the shift; rebuild pending or incomplete (stale intervals retained)"
+            )
+        elif gaps:
+            reasons.append(
+                "interval_coverage_gap: no current intervals cover "
+                + ", ".join(f"{g['start_ts']}~{g['end_ts']}" for g in gaps)
+            )
+        if undeterminable:
+            reasons.append(
+                "intervals_undeterminable: "
+                + "; ".join(
+                    f"{u['start_ts']}~{u['end_ts']}: {u['reason']}"
+                    for u in undeterminable
+                )
+            )
+        if boundary_crossing and full_coverage:
+            reasons.append(
+                "interval_boundary_crossing: interval(s) extend beyond the shift "
+                "window; shift energy is not exactly attributable"
+            )
+
+        samples_ok = missing == 0 and overdue == 0 and multi == 0
+        analysis_ready = samples_ok and full_coverage and all_determinable and exact_tiling
+        # Energy is summed only when current intervals tile the shift exactly
+        # and every one is determinable — never a placeholder zero.
+        shift_energy = None
+        if full_coverage and all_determinable and exact_tiling:
+            shift_energy = round(sum(iv["energy_kwh"] for iv in relevant), 9)
+
+        coverage = {
+            "full_coverage": full_coverage,
+            "gaps": gaps,
+            "undeterminable_intervals": undeterminable,
+            "boundary_crossing_intervals": boundary_crossing,
+            "pending_rebuild": pending_rebuild,
+        }
+
+        cur = conn.execute(
+            "INSERT INTO shift_assessments (device_id, shift_start, shift_end, "
+            "collect_deadline, assessed_at, analysis_ready, shift_energy_kwh, "
+            "expected_samples, on_time_count, overdue_count, missing_count, "
+            "multi_source_count, samples_json, coverage_json, reasons_json, status) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'current')",
+            (
+                device, start_iso, end_iso, deadline_iso, now_iso,
+                1 if analysis_ready else 0, shift_energy, len(sample_ts),
+                on_time, overdue, missing, multi,
+                json.dumps(samples), json.dumps(coverage), json.dumps(reasons),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return {
+        "id": cur.lastrowid,
+        "device_id": device,
+        "shift_start": start_iso,
+        "shift_end": end_iso,
+        "collect_deadline": deadline_iso,
+        "assessed_at": now_iso,
+        "status": "current",
+        "analysis_ready": analysis_ready,
+        "shift_energy_kwh": shift_energy,
+        "expected_samples": len(sample_ts),
+        "on_time_count": on_time,
+        "overdue_count": overdue,
+        "missing_count": missing,
+        "multi_source_count": multi,
+        "samples": samples,
+        "coverage": coverage,
+        "reasons": reasons,
+    }
+
+
+def _assessment_row_to_dict(r: sqlite3.Row) -> dict:
+    return {
+        "id": r["id"],
+        "device_id": r["device_id"],
+        "shift_start": r["shift_start"],
+        "shift_end": r["shift_end"],
+        "collect_deadline": r["collect_deadline"],
+        "assessed_at": r["assessed_at"],
+        "status": r["status"],
+        "analysis_ready": bool(r["analysis_ready"]),
+        "shift_energy_kwh": r["shift_energy_kwh"],
+        "expected_samples": r["expected_samples"],
+        "on_time_count": r["on_time_count"],
+        "overdue_count": r["overdue_count"],
+        "missing_count": r["missing_count"],
+        "multi_source_count": r["multi_source_count"],
+        "samples": json.loads(r["samples_json"]),
+        "coverage": json.loads(r["coverage_json"]),
+        "reasons": json.loads(r["reasons_json"]),
+    }
+
+
+def list_shift_assessments(
+    conn: sqlite3.Connection,
+    device_id: str | None,
+    status: str,
+) -> list[dict]:
+    clauses: list[str] = []
+    params: list[str] = []
+    if status != "all":
+        clauses.append("status = ?")
+        params.append(status)
+    if device_id is not None:
+        clauses.append("device_id = ?")
+        params.append(device_id)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        f"SELECT * FROM shift_assessments{where} ORDER BY id DESC",
+        params,
+    ).fetchall()
+    return [_assessment_row_to_dict(r) for r in rows]

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def utc_now_iso() -> str:
@@ -97,3 +97,105 @@ class RebuildOut(BaseModel):
     rebuilt_devices: list[str]
     failed_devices: dict[str, str]
     detail: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Shift sampling quality control
+# ---------------------------------------------------------------------------
+
+class ShiftQcIn(BaseModel):
+    device_id: str = Field(min_length=1, description="设备编号")
+    shift_start: datetime = Field(description="班次开始时刻（UTC，需带时区）")
+    shift_end: datetime = Field(
+        description="班次结束时刻（UTC，需带时区）；与开始时刻相隔 15 分钟整数倍"
+    )
+    collect_deadline: datetime = Field(
+        description="收数截止时刻（UTC，需带时区），必须晚于班次结束；截止后才可核对"
+    )
+
+    @field_validator("device_id")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be blank")
+        return v
+
+    @field_validator("shift_start", "shift_end", "collect_deadline")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError(
+                "timestamp must include a timezone (use UTC, e.g. 2026-01-01T00:00:00Z)"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _check_window(self) -> "ShiftQcIn":
+        start = self.shift_start.astimezone(timezone.utc)
+        end = self.shift_end.astimezone(timezone.utc)
+        deadline = self.collect_deadline.astimezone(timezone.utc)
+        if end <= start:
+            raise ValueError("shift_end must be later than shift_start")
+        seconds = (end - start).total_seconds()
+        if seconds % 900 != 0:
+            raise ValueError(
+                "shift_start and shift_end must be an integer multiple of "
+                "15 minutes apart"
+            )
+        if seconds / 900 + 1 > 10001:
+            raise ValueError("shift window too long: more than 10000 sample moments")
+        if deadline <= end:
+            raise ValueError("collect_deadline must be later than shift_end")
+        return self
+
+
+class ShiftSampleSourceOut(BaseModel):
+    source_id: str
+    revision: int
+    accepted_at: str
+
+
+class ShiftSampleOut(BaseModel):
+    ts: str
+    status: str  # on_time | overdue | missing | multi_source
+    sources: list[ShiftSampleSourceOut]
+
+
+class ShiftSpanOut(BaseModel):
+    start_ts: str
+    end_ts: str
+
+
+class ShiftUndeterminableOut(BaseModel):
+    start_ts: str
+    end_ts: str
+    reason: str | None
+
+
+class ShiftCoverageOut(BaseModel):
+    full_coverage: bool
+    gaps: list[ShiftSpanOut]
+    undeterminable_intervals: list[ShiftUndeterminableOut]
+    boundary_crossing_intervals: list[ShiftSpanOut]
+    pending_rebuild: bool
+
+
+class ShiftQcOut(BaseModel):
+    id: int
+    device_id: str
+    shift_start: str
+    shift_end: str
+    collect_deadline: str
+    assessed_at: str
+    status: str  # current | stale
+    analysis_ready: bool
+    shift_energy_kwh: float | None  # NULL unless exactly determinable; never a fake zero
+    expected_samples: int
+    on_time_count: int
+    overdue_count: int
+    missing_count: int
+    multi_source_count: int
+    samples: list[ShiftSampleOut]
+    coverage: ShiftCoverageOut
+    reasons: list[str]

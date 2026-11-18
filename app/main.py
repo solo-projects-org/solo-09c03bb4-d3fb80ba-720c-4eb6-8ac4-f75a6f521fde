@@ -1,4 +1,4 @@
-"""FastAPI application: meter readings, handovers, intervals, rebuild.
+"""FastAPI application: meter readings, handovers, intervals, rebuild, shift QC.
 
 Swagger UI is served at ``/docs`` (ReDoc at ``/redoc``) and the OpenAPI
 document at ``/openapi.json``.
@@ -13,8 +13,16 @@ from fastapi.responses import JSONResponse
 
 from .config import Settings
 from .database import ConnectionPool
-from .errors import ConflictError, RebuildFailure
-from .models import AcceptOut, HandoverIn, IntervalOut, ReadingIn, RebuildOut
+from .errors import ConflictError, RebuildFailure, UnprocessableError
+from .models import (
+    AcceptOut,
+    HandoverIn,
+    IntervalOut,
+    ReadingIn,
+    RebuildOut,
+    ShiftQcIn,
+    ShiftQcOut,
+)
 from . import service
 
 
@@ -36,8 +44,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         description=(
             "提交按设备区分的累计电表读数与换表交接，按相邻读数生成带来源编号的"
             "区间电量。倒退读数或交接缺失记为无法判定（energy_kwh=null），绝不报零。"
+            "班次采样质控按各来源现行修订的受理时间核对每 15 分钟应有读数，"
+            "全部准时且唯一、现行可判定区间完整覆盖班次时才标为可供分析。"
         ),
-        version="1.0.0",
+        version="1.1.0",
         lifespan=lifespan,
     )
 
@@ -47,6 +57,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(ConflictError)
     async def conflict_handler(request: Request, exc: ConflictError):
         return JSONResponse(status_code=409, content={"detail": exc.detail})
+
+    @app.exception_handler(UnprocessableError)
+    async def unprocessable_handler(request: Request, exc: UnprocessableError):
+        return JSONResponse(status_code=422, content={"detail": exc.detail})
 
     @app.get("/health", tags=["运维"])
     def health(conn: sqlite3.Connection = Depends(db)):
@@ -150,6 +164,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "SELECT * FROM rebuild_runs ORDER BY id DESC LIMIT 50"
             ).fetchall()
         ]
+
+    @app.post("/shift-qc", response_model=ShiftQcOut, status_code=201, tags=["班次质控"])
+    def post_shift_qc(
+        payload: ShiftQcIn,
+        conn: sqlite3.Connection = Depends(db),
+    ):
+        """核对单设备班次采样质量并留存结论。
+
+        在收数截止时刻之后调用：按各来源现行修订的受理时间，核对首末时刻在内、
+        每隔 15 分钟应有的读数，标出缺失、逾期与同刻多来源（附来源编号）。
+        仅当采样时刻全部准时且唯一、现行可判定区间完整覆盖班次时，
+        `analysis_ready` 才为 true；区间待重建或无法判定会在 `reasons` 中说明，
+        `shift_energy_kwh` 保持 null，绝不当作零电量。
+        """
+        return service.assess_shift(conn, payload)
+
+    @app.get("/shift-qc", response_model=list[ShiftQcOut], tags=["班次质控"])
+    def get_shift_qc(
+        device_id: str | None = Query(default=None),
+        status: str = Query(default="current", pattern="^(current|stale|all)$"),
+        conn: sqlite3.Connection = Depends(db),
+    ):
+        """查询留存的班次质控结论（默认只返回现行结论）。"""
+        return service.list_shift_assessments(conn, device_id, status)
 
     app.state.settings = settings
     return app

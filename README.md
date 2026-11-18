@@ -3,6 +3,8 @@
 按设备收集累计电表读数与换表交接，按相邻读数生成带来源编号的区间电量。
 换表后新表起始值不会被算成负用电：跨表区间只有在区间内存在**唯一匹配**的
 换表交接时才分段结算，否则标记为“无法判定”（`energy_kwh = null`），绝不报零。
+另提供单设备班次采样质控：按各来源现行修订的受理时间核对每 15 分钟应有读数，
+决定班次电量能否交给分析组。
 
 ## 启动（Docker Compose）
 
@@ -62,6 +64,44 @@ docker compose up --build
 
 查询参数：`device_id`（可选）、`status=current|stale|all`（默认 current）。
 
+## 班次采样质控 `POST /shift-qc`
+
+厂区能源数据员在**收数截止之后**核对某设备整班抄表是否准时齐全：
+
+```json
+{
+  "device_id": "DEV-A",
+  "shift_start": "2026-11-10T00:00:00Z",   // UTC，需带时区
+  "shift_end": "2026-11-10T08:00:00Z",     // 与开始相隔 15 分钟整数倍
+  "collect_deadline": "2026-11-10T08:15:00Z" // 必须晚于班次结束，且已过时（否则 422）
+}
+```
+
+核对规则：
+
+- 采样时刻为 `shift_start` 到 `shift_end`（首末在内）每隔 15 分钟一个；
+- 每个时刻只看**各来源现行（最高）修订**的读数，按该修订的**受理时间**判定：
+  - 无现行读数 → `missing`（缺失）；
+  - 恰好一个来源且受理时间不晚于截止 → `on_time`（准时）；
+  - 受理时间晚于截止 → `overdue`（逾期）；**逾期修订不能沿用旧修订的准时资格**，
+    旧修订再准时，只要现行修订逾期即判逾期；
+  - 同一时刻多个来源均有现行读数 → `multi_source`（同刻多来源）；
+  - 判定结果均附来源编号、修订号与受理时间；
+- 仅当采样时刻**全部准时且唯一**，且**现行可判定区间完整覆盖班次**时，
+  `analysis_ready` 才为 `true`；
+- 区间待重建（`coverage.pending_rebuild`）或无法判定（`coverage.undeterminable_intervals`）
+  时，`reasons` 逐条说明原因，`shift_energy_kwh` 保持 `null`，**绝不当作零电量**；
+  只有现行区间恰好铺满班次且全部可判定时才汇总班次电量。
+
+结论持久化于 `shift_assessments` 表，经 `GET /shift-qc` 查询
+（参数：`device_id` 可选、`status=current|stale|all`，默认 current）：
+
+- 读数或交接一经**受理**，相关设备的现行结论在**同一事务内**置为 `stale`
+  （幂等重放不影响）；重建失败或进程重启都不会恢复其现行资格；
+- 同一设备同一班次窗口重新质控会取代旧结论（旧结论转 `stale` 留存备查），
+  其他窗口、其他设备的结论照常可查；
+- 每次质控在单事务内读取一致的现行数据（各来源最高修订 + current 区间）后落库。
+
 ## 迟到数据与重建的一致性保证
 
 1. 读数/交接一旦**受理**，受影响设备的全部 `current` 区间在同一事务内立即
@@ -90,7 +130,7 @@ pytest -q
 
 ```
 app/            FastAPI 应用（models/database/service/main）
-tests/          17 项端到端自测（TestClient + 临时 SQLite 文件）
+tests/          33 项端到端自测（TestClient + 临时 SQLite 文件）
 Dockerfile      python:3.11-slim 镜像，含 /health 健康检查
 docker-compose.yml
 ```
